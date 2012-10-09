@@ -468,7 +468,7 @@ fi
 
 DEVINFO=($(iw dev ${DEV} info 2>&1 | sed -n -e 's/^\t\(type\|wiphy\) \([^ ]\+\).*/\2/p'))
 if [[ -z ${DEVINFO[1]} ]] ;then
-    printf "ERROR: The script $(basename $0) needs iw version 3.6 or higher. Please review.\niw version\n$(iw --version)\n"
+    printf "ERROR: The script $(basename $0) needs latest version of iw. Please review.\niw version\n$(iw --version)\n"
     printf "Please download and install iw from the following link:\n${IW_SOURCE}\n"
     exit 1
 fi
