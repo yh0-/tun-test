@@ -1,0 +1,617 @@
+#!/bin/bash
+# Bash program for launching airtun-ng to join OPEN/WEP access point
+#
+# Copyright (C) 2012 Yahya Sjahrony <yysjryysjr AT gmail DOT com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+AUTH_TIMEOUT=60
+VERBOSE=0
+IW_SOURCE="http://wireless.kernel.org/download/iw/iw-latest.tar.bz2"
+IW_PATH="/opt/sources/iw-3.6"
+CONF="$(basename $0).conf"
+
+if [[ $(id -u) != 0 ]] ; then
+    printf "Run it as root\n"
+    exit 1
+fi
+
+[[ -x "${IW_PATH}/iw" ]] && export PATH="${IW_PATH}:${PATH}"
+
+if [[ ! -x $(command -v aireplay-ng 2>&1) ]] ; then
+    printf "aireplay-ng is not found.\n"; 
+    exit 1
+fi
+
+if [[ ! -x $(command -v airtun-ng 2>&1) ]] ; then
+    printf "airtun-ng is not found.\n"
+    exit 1
+fi
+
+AIRMON_ZC=$(command -v airmon-zc 2>&1)
+if [[ ! -x ${AIRMON_ZC} ]] ; then
+    printf "airmon-zc is not found.\n"
+    exit 1
+fi
+
+OUTPUT=$(${AIRMON_ZC})
+if printf "${OUTPUT}" | grep -q "install\|ethtool failed" ; then
+    printf "Output from airmon-zc:\n"
+    printf "${OUTPUT}"
+    exit 1
+fi
+
+if [[ ! -x $(command -v ip 2>&1) ]] ; then
+    printf "iproute2 is not found.\n"
+    exit 1
+fi
+
+if [[ ! -x $(command -v hexdump 2>&1) ]] ; then 
+    printf "hexdump is not found.\n"
+    exit 1
+fi
+
+if [[ ! -a /dev/net/tun ]] ; then
+    modprobe tun
+    sleep 1
+fi
+
+if [[ ! -a /dev/net/tun ]] ; then 
+    printf "TUN/TAP support is not found in this kernel.\n"
+    exit 1
+fi
+
+if [[ ! -e ${CONF} ]] ; then
+    printf "# $(basename $0) configuratin file\n" > ${CONF}
+    printf "IP=192.168.1.13\n" >> ${CONF}
+    printf "NETMASK=24\n" >> ${CONF}
+    printf "GATEWAY=192.168.1.1\n" >> ${CONF}
+    printf "DNS1=192.168.1.1\n" >> ${CONF}
+    printf "DNS2=8.8.8.8\n" >> ${CONF}
+    printf "SEARCH_DOMAIN=\n" >> ${CONF}
+    printf "DNS_DOMAIN=\n" >> ${CONF}
+fi
+
+usage() {
+    printf "\nScript for launching airtun-ng to join OPEN/WEP access point\n"
+    printf "2011 (C) Yahya Sjahrony <yysjryysjr AT gmail DOT com>\n\n"
+    printf "Required Arguments:\n"
+    printf "  -i, --interface=<card>   Wireless card in monitor mode\n"
+    printf "  -b, --bssid=<bssid>      BSSID of the access point (AP MAC address)\n"
+    printf "  -c, --channel=<channel>  Set the 802.11 channel for the card\n\n"
+    printf "Optional Arguments:\n"
+    printf "  -e, --essid=<ssid>       Set AP SSID (AP Network Name)\n"
+    printf "  -w, --wep-key=<WEP key>  Use this WEP key to encrypt packets\n"
+    printf "  -s, --set-ip             Set IP of the created TAP device atX (and \n"
+    printf "                           netmask, gateway) afterwards with the\n"
+    printf "                           content of config file: $(basename $0).conf.\n"
+    printf "  -v, --verbose            Verbose mode\n"
+    printf "  -h, --help               Display this help and exit\n\n"
+    printf "Example:\n"
+    printf "  $(basename $0) -i mon0 -b 00:19:BE:80:1E:46 -c 6 -w abcde\n\n"
+    exit
+}
+
+get_wepkey(){
+    [[ -z $1 ]] && return 1
+
+    local k="$1"
+
+    # Match 64/128/152/256-bit WEP key, e.g. 0011223344 etc
+    if [[ $k =~ ^([0-9a-fA-F]{2}){5}$|^([0-9a-fA-F]{2}){13}$|^([0-9a-fA-F]{2}){16}$|^([0-9a-fA-F]{2}){29}$ ]] ; then
+        KEY_HEX=$(echo ${k} | sed 's/../&:/g')
+        KEY_HEX=${KEY_HEX%":"}
+
+        local x=$(echo ${k} | sed 's/../& /g') i= s=
+        for i in ${x}; do s="${s}\\x${i}"; done
+        KEY_STR=$(printf "${s}")
+
+    # Match 64/128/152/256-bit WEP key, e.g. 00:11:22:33:44 etc
+    elif [[ $k =~ ^([0-9a-fA-F]{2}[:]){4}[0-9a-fA-F]{2}$|^([0-9a-fA-F]{2}[:]){12}[0-9a-fA-F]{2}$|^([0-9a-fA-F]{2}[:]){15}[0-9a-fA-F]{2}$|^([0-9a-fA-F]{2}[:]){28}[0-9a-fA-F]{2}$ ]] ; then
+
+        KEY_HEX=${k}
+
+        local x=$(echo ${k//:/} | sed 's/../& /g') i= s=
+        for i in ${x}; do s="${s}\\x${i}"; done
+        KEY_STR=$(printf "${s}")
+
+    # Assume it's ascii
+    else 
+        case ${#k} in #?
+            5|13|16|29);;
+            *)  
+                printf "ERROR: The specified plaintext or ASCII WEP key has ${#k} characters.\n"
+                printf "It must have 5/13/16/29 characters to be valid.\n"
+                return 1
+                ;;
+        esac
+
+        KEY_STR=${k}
+        KEY_HEX=$(printf "${k}" | hexdump -v -e '/1 "%02x "' | sed 's/\(.*\) /\1/')
+        KEY_HEX=${KEY_HEX// /:}
+    fi
+}
+
+conf_dev(){
+    [[ ${VERBOSE} -gt 1 ]] && printf "\nConfiguring device '"$1"'..\n"
+
+    if ip link show dev "$1" | grep -q "\<UP\>" ; then
+        if [[ "$2" == "MONDEV_UP" ]] ; then
+            MONDEV_UP=1
+        elif [[ "$2" == "DEV_UP" ]] ; then
+            DEV_UP=1
+        fi
+    else
+        [[ ${VERBOSE} -gt 1 ]] && printf "ip link set up dev "$1"\n"
+        ip link set up dev "$1"
+        sleep 1s
+    fi
+
+    if [[ ${CH} -lt 1000 ]] ; then
+        [[ ${VERBOSE} -gt 1 ]] && printf "iw dev "$1" set channel ${CH}\n"
+        iw dev "$1" set channel ${CH} 
+    else
+        [[ ${VERBOSE} -gt 1 ]] && printf "iw dev "$1" set freq ${CH}\n"
+        iw dev "$1" set freq ${CH}
+    fi
+
+    if [[ $? -ne 0 ]] ; then
+        printf "\nFailed to set channel on '"$1"'.\n\n"
+        return 1
+    fi
+}
+
+cleanup(){
+    echo "Exiting.."
+
+    if ps -p ${WGET_PID} > /dev/null 2>&1 ; then
+        kill ${WGET_PID} 
+    fi
+
+    ip addr flush dev ${TUNDEV}
+
+    if [[ -f "/var/run/airtun-ng-${MONDEV}.pid" ]]; then
+        pid=$(cat "/var/run/airtun-ng-${MONDEV}.pid")
+        if ps -p ${pid} > /dev/null 2>&1; then
+            kill ${pid}
+        fi
+        rm "/var/run/airtun-ng-${MONDEV}.pid"
+    fi
+
+    if [[ ! -z ${DEV} ]] ; then
+        if [[ ${DEV_UP} -eq 0 ]] ; then
+            ip link set down ${DEV}
+            sleep 1
+        fi
+    fi
+
+    if [[ ${MONDEV_UP} -eq 0 ]] ; then
+        ip link set down ${MONDEV}
+        sleep 1
+    fi
+    
+    if [[ -n ${DNS1} || -n ${DNS2} || -n ${DNS3} ]] ; then
+        [[ -f /etc/resolv.conf.bak ]] && mv /etc/resolv.conf.bak /etc/resolv.conf
+    fi
+
+    printf "\n"
+    exit 1
+}
+
+do_ping(){
+    [[ -z $1 ]] && return 1
+
+    local host="$1" iface="$2" ping_error ping_result x 
+ 
+    [[ -z ${iface} ]] && {
+        ! ip route | grep -qs default && return 1
+        iface=$(ip route | grep "^default" | sed -nr 's/.*dev (\S+).*/\1/p')
+    }
+
+    [[ -n ${iface} ]] && iface="-I ${iface}"
+
+    ping_error=$(mktemp .ping-XXXXXX)
+
+    printf "\nPinging host ${host}..\n"
+    printf "ping -q -c 4 -w 5 ${host} ${iface}\n"
+
+    ping_result=$(ping -q -c 4 -w 5 ${host} ${iface} 2> ${ping_error})
+    [[ ! -z ${ping_result} ]] && echo "${ping_result}" | sed q
+
+    if [[ -s ${ping_error} ]] ; then
+        cat ${ping_error} && rm ${ping_error}
+        return 1
+    fi
+
+    [[ -e ${ping_error} ]] && rm ${ping_error}
+
+    x=$(echo "${ping_result}" | awk '/packets transmitted/ {print $4}')
+    if [[ ${x} == "0" ]] ; then
+        printf "ping: ${host} is unpingable.\n"
+        return 1
+    else
+        printf "ping: Got ${x} packets back. "
+        printf "Round trip time average: $(echo "${ping_result}" | sed -nr 's/.*= (\S+)\/(\S+)\/(\S+)\/(\S+).*/\2/p') ms\n"
+    fi
+}
+
+USER_AGENT="Mozilla/5.0 (iPhone; U; CPU like Mac OS X; en) AppleWebKit/420+ (KHTML, like Gecko) Version/3.0 Mobile/1A543 Safari/419.3"
+
+dl_speed_test(){
+    local iface="$1" url="http://speedtest.wdc01.softlayer.com/downloads/test500.zip"
+    [[ -z ${iface} ]] && {
+        ! ip route | grep -qs default && return 1
+        iface=$(ip route | grep "^default" | sed -nr 's/.*dev (\S+).*/\1/p')
+    }
+    local local_ip=$(ip address show dev ${iface} | awk -F"[/ ]+" '/inet / {print $3}')
+
+    printf "\nTest download speed...\n"
+    printf "wget -4 --bind-address=${local_ip} --no-proxy -c -t 3 -U \"${USER_AGENT}\" -O /dev/null "${url}"\n"
+    wget -4 --bind-address=${local_ip} --no-proxy -c -t 3 -U "${USER_AGENT}" -O /dev/null "${url}" &
+    WGET_PID=$!
+}
+
+conf_ip(){
+    local x
+
+    printf "\nSetting fixed IP on "$1"..\n"
+    printf "ip address add ${IP}/${NETMASK} brd + dev "$1"\n"
+    x=$(ip address add ${IP}/${NETMASK} brd + dev "$1" 2>&1)
+    if [[ ! -z ${x} ]] ; then
+        if [[ ${x} == "RTNETLINK answers: File exists" ]] ; then
+            ip address del $(ip address show dev "$1" | awk '/inet / {print $2}') dev "$1" 
+            ip address add ${IP}/${NETMASK} brd + dev "$1" || {
+                printf "Could not configure interface\n\n"
+                return 1
+            }
+        else
+            printf "${x}\n"
+            return 1
+        fi
+    fi
+    printf "Done!\n"
+
+    local nameservers="${DNS1} ${DNS2} ${DNS3}"
+    if [[ -n ${nameservers} ]] ; then
+        mv /etc/resolv.conf /etc/resolv.conf.bak
+        : >/etc/resolv.conf
+        if [[ -n ${SEARCH_DOMAIN} ]] ; then
+            echo search ${SEARCH_DOMAIN} >> /etc/resolv.conf
+        elif [[ -n ${DNS_DOMAIN} ]] ; then
+            echo domain ${DNS_DOMAIN} >> /etc/resolv.conf
+        fi
+        for nameserver in ${nameservers}; do
+            echo nameserver ${nameserver} >> /etc/resolv.conf
+        done
+    fi
+
+    if [[ -n ${GATEWAY} ]] ; then
+        printf "\nAdding default gateway...\n"
+        printf "ip route add default via ${GATEWAY} dev "$1"\n"
+        x=$(ip route add default via ${GATEWAY} dev "$1" 2>&1)
+        if [[ ! -z ${x} ]] ; then
+            if [[ ${x} == "RTNETLINK answers: File exists" ]] ; then
+                ip route del default
+                ip route flush cache #
+                ip route add default via ${GATEWAY} dev "$1" || {
+                    printf "Adding gateway ${GATEWAY} failed\n\n"
+                    return 1
+                }
+            else
+                printf "${x}\n"
+                return 1
+            fi
+        fi
+        printf "Done!\n"
+    fi
+}
+
+option_requires_argument(){
+    printf "$(basename $0): option requires an argument -- '${1//-/}'\n"
+    exit 1
+}
+
+[[ $# -eq 0 ]] && usage 
+while [[ $# -gt 0 ]] ; do
+    case "$1" in
+        -h|--help) 
+            usage;;
+        -i|--interface|--interface=*)
+            case "$1" in
+                --interface=*)
+                    DEV=${1#*=}
+                    shift
+                    ;;
+                *)
+                    DEV="$2"
+                    shift 2 || option_requires_argument "$1"
+                    ;;
+            esac
+            ;;
+        -b|--bssid|--bssid=*)
+            case "$1" in
+                --bssid=*)
+                    BSSID=${1#*=}
+                    shift
+                    ;;
+                *)
+                    BSSID="$2"
+                    shift 2 || option_requires_argument "$1"
+                    ;;
+            esac
+            ;;
+        -c|--channel|--channel=*)
+            case "$1" in
+                --channel=*)
+                    CH=${1#*=}
+                    shift
+                    ;;
+                *)
+                    CH="$2"
+                    shift 2 || option_requires_argument "$1"
+                    ;;
+            esac
+            ;;
+        -e|--essid|--essid=*)
+            case "$1" in
+                --essid=*)
+                    ESSID=${1#*=}
+                    shift
+                    ;;
+                *)
+                    ESSID="$2"
+                    shift 2 || option_requires_argument "$1"
+                    ;;
+            esac
+            ;;
+        -w|--wep-key|--wep-key=*)
+            case "$1" in
+                --essid=*)
+                    WEP_KEY=${1#*=}
+                    shift
+                    ;;
+                *)
+                    WEP_KEY="$2"
+                    shift 2 || option_requires_argument "$1"
+                    ;;
+            esac
+            ;;
+        -s|--set-ip)
+            CONF_IP="1"
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=$((VERBOSE+1))
+            shift
+            ;;
+        -vv|-vvv)
+            VERBOSE=2
+            shift
+            ;;
+        -*|*)
+            printf "$(basename $0): invalid option -- '${1//-/}'\n"
+            printf "Try \`$(basename $0) --help' for more information.\n"
+            exit 1
+            ;; 
+    esac
+done
+
+if [[ -z ${DEV} || -z ${BSSID} || -z ${CH} ]] ; then
+    printf "$(basename $0): missing required arguments\n"
+    printf "Try \`$(basename $0) --help' for more information.\n"
+    exit 1
+fi
+
+trap '{ echo "Ctrl+C trap caught"; cleanup; }' INT
+
+if ! ip link show dev ${DEV} > /dev/null 2>&1; then
+    printf "ERROR: The specified device '${DEV}' does not exist. Please review.\n"
+    exit 1
+fi
+
+if [[ ! $BSSID =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ ]] ; then
+    printf "ERROR: The specified BSSID '${BSSID}' is not a valid MAC address. Please review.\n"
+    exit 1
+fi
+
+if [[ $CH =~ [^0-9] ]] ; then
+    printf "ERROR: The specified channel '${CH}' is a not integer. Please review.\n"
+    exit 1
+fi
+
+if [[ -n ${WEP_KEY} ]] ; then
+    get_wepkey ${WEP_KEY} || exit 1
+    WEP_KEY=${KEY_HEX}
+fi
+
+if [[ -n ${CONF_IP} ]] ; then
+    if [[ -f ${CONF} && -r ${CONF} ]] ; then
+        :
+    else
+        printf "ERROR: Cannot read contents of ${CONF}\n"
+        exit 1
+    fi
+
+    while read line; do
+        var=$(echo "${line}" | sed 's/^[ \t]*//; s/#.*$//; s/[ \t]*$//')
+        case "${var}" in
+            IP=*) 
+                [[ -z ${IP} ]] && IP=$(echo "${var#*=}"| sed 's/^[ \t]*//;s/^"//;s/"$//');;
+            NETMASK=*) 
+                [[ -z ${NETMASK} ]] && NETMASK=$(echo "${var#*=}"| sed 's/^[ \t]*//;s/^"//;s/"$//');;
+            GATEWAY=*) 
+                [[ -z ${GATEWAY} ]] && GATEWAY=$(echo "${var#*=}"| sed 's/^[ \t]*//;s/^"//;s/"$//');;
+            DNS1=*) 
+                [[ -z ${DNS1} ]] && DNS1=$(echo "${var#*=}"| sed 's/^[ \t]*//;s/^"//;s/"$//');;
+            DNS2=*) 
+                [[ -z ${DNS2} ]] && DNS2=$(echo "${var#*=}"| sed 's/^[ \t]*//;s/^"//;s/"$//');;
+            SEARCH_DOMAIN=*) 
+                [[ -z ${SEARCH_DOMAIN} ]] && SEARCH_DOMAIN=$(echo "${var#*=}"| sed 's/^[ \t]*//;s/^"//;s/"$//');;
+            DNS_DOMAIN=*) 
+                [[ -z ${DNS_DOMAIN} ]] && DNS_DOMAIN=$(echo "${var#*=}"| sed 's/^[ \t]*//;s/^"//;s/"$//');;
+        esac
+    done < ${CONF}
+    [[ -z ${IP} ]] && IP=192.168.1.13
+    [[ -z ${NETMASK} ]] && NETMASK=24
+fi
+
+DEVINFO=($(iw dev ${DEV} info 2>&1 | sed -n -e 's/^\t\(type\|wiphy\) \([^ ]\+\).*/\2/p'))
+if [[ -z ${DEVINFO[1]} ]] ;then
+    printf "ERROR: The script $(basename $0) needs iw version 3.6 or higher. Please review.\niw version\n$(iw --version)\n"
+    printf "Please download and install iw from the following link:\n${IW_SOURCE}\n"
+    exit 1
+fi
+
+if [[ ${DEVINFO[0]} != "monitor" ]] ;then
+    printf "ERROR: The specified device '${DEV}' isn't in monitor mode. It's in ${DEVINFO[0]} mode. Please review.\n"
+    exit 1
+fi
+
+if [[ -f "/var/run/airtun-ng-${MONDEV}.pid" ]]; then
+    pid=$(cat "/var/run/airtun-ng-${MONDEV}.pid")
+    if ps -p ${pid} > /dev/null 2>&1 ; then
+        printf "Lock file exists!\n" 
+        printf "Process with PID $(cat "/var/run/airtun-ng-${MONDEV}.pid") (airtun-ng) is running on interface ${MONDEV}\n"
+        exit 1
+    fi
+fi
+
+printf "\nStarting $(basename $0) at $(echo $(date))..\n"
+printf "\nRunning $(basename ${AIRMON_ZC}) check...\n"
+${AIRMON_ZC} check
+MONDEV=${DEV}
+PHYDEV="phy"${DEVINFO[1]}
+
+unset DEV
+if [[ -d "/sys/class/ieee80211/${PHYDEV}/device/net" ]]; then
+    for i in $(ls "/sys/class/ieee80211/${PHYDEV}/device/net/"); do
+        unset type
+        case $(cat "/sys/class/ieee80211/${PHYDEV}/device/net/${i}/type") in 
+            803)
+                if [[ ${i} != "${MONDEV}" ]] ; then
+                    printf "\nWARNING: It seems there are more than 1 monitor device under Wiphy '${PHYDEV}'.\n"
+                    printf "WARNING: This script might or might not work!\n"
+                fi
+                ;;
+            *) 
+                type=$(iw dev ${i} info 2>&1 | sed -nr "s/^\ttype (\S+)/\1/p")
+                if [[ ${type} != "managed" ]] ; then
+                    printf "\nWARNING: It seems there is a ${type} mode device under Wiphy '${PHYDEV}'.\n"
+                    printf "WARNING: This script might or might not work!\n"
+                fi
+                DEV=${i}
+                break
+                ;;
+        esac
+    done
+fi
+
+MONDEV_UP=0 
+DEV_UP=0
+conf_dev ${MONDEV} MONDEV_UP || cleanup
+
+[[ ${VERBOSE} -gt 1 ]] && printf "iw dev ${MONDEV} set bitrates\n"
+iw dev ${MONDEV} set bitrates 
+
+if [[ ! -z ${DEV} ]] ; then
+    conf_dev ${DEV} DEV_UP || cleanup
+fi
+
+DEVMAC=$(ip link show dev ${MONDEV} 2>&1 | awk '/link/{print $2}')
+
+[[ ${VERBOSE} -ge 1 ]] && printf "\nRunning aireplay-ng..\n" || printf "\n"
+cnt=0
+start_time=$(date +%s)
+while [[ $(($(date +%s)-${start_time})) -le ${AUTH_TIMEOUT} ]]; do
+    if [[ ${cnt} -eq 0 ]] ; then
+        if [[ -n ${ESSID} ]] ; then 
+            printf "aireplay-ng -1 0 -a ${BSSID} -h ${DEVMAC} -e \"${ESSID}\" -T 1 ${MONDEV}\n"
+        else
+            printf "aireplay-ng -1 0 -a ${BSSID} -h ${DEVMAC} -T 1 ${MONDEV}\n"
+        fi
+        cnt=1
+    fi
+
+    if [[ -n ${ESSID} ]] ; then 
+        OUTPUT=$(aireplay-ng -1 0 -a ${BSSID} -h ${DEVMAC} -e "${ESSID}" -T 1 ${MONDEV})
+    else
+        OUTPUT=$(aireplay-ng -1 0 -a ${BSSID} -h ${DEVMAC} -T 1 ${MONDEV}) 
+    fi
+    retval=$?
+    [[ ${retval} -eq 0 ]] && break || sleep 1s
+done
+
+printf "${OUTPUT}\n" | sed "s/^\([0-9]\{2\}\:\)\{2\}[0-9]\{2\}//g;s/^[ \t]*//;/^$/d"
+
+if [[ ${retval} -ne 0 ]] ; then
+    printf "\nFailed to join the network.\n\n"
+    cleanup
+fi
+
+i=0; while [[ -d "/sys/class/net/at${i}/" ]]; do 
+    i=$(($i+1))
+done 
+TUNDEV="at"${i}
+
+[[ ${VERBOSE} -ge 1 ]] && printf "\nRunning airtun-ng...\n" || printf "\n"
+[[ -n ${WEP_KEY} ]] && airtun_arg="-w ${WEP_KEY}" || airtun_arg=
+printf "airtun-ng -a ${BSSID} -h ${DEVMAC} -t 1 ${airtun_arg} ${MONDEV}\n"
+airtun-ng -a ${BSSID} -h ${DEVMAC} -t 1 ${airtun_arg} ${MONDEV} &
+echo $! > "/var/run/airtun-ng-${MONDEV}.pid"
+sleep 1s
+printf "Process with PID $(cat "/var/run/airtun-ng-${MONDEV}.pid") (airtun-ng) is running on interface ${MONDEV}\n"
+
+[[ ! -f "/sys/class/net/${TUNDEV}/tun_flags" ]] && {
+    printf "\nERROR: Something went wrong. The script $(basename $0) was unable to find the TUN/TAP device.\n\n"
+    cleanup
+}
+
+[[ ${VERBOSE} -ge 1 ]] && printf "\nSetting '${TUNDEV}' MAC address with '${MONDEV}' MAC address..\n" || printf "\n"
+printf "ip link set down dev ${TUNDEV}\n"
+ip link set down dev ${TUNDEV}
+sleep 1s
+
+printf "ip link set address ${DEVMAC} dev ${TUNDEV}\n"
+ip link set address ${DEVMAC} dev ${TUNDEV} || printf "\nFailed to set MAC address on '${TUNDEV}'.\n\n"
+
+printf "ip link set up dev ${TUNDEV}\n"
+ip link set up dev ${TUNDEV}
+sleep 1s
+
+cnt=0
+while sleep 1s; do
+    if [[ -n ${ESSID} ]] ; then 
+        OUTPUT=$(aireplay-ng -1 0 -a ${BSSID} -h ${DEVMAC} -e "${ESSID}" -T 1 ${MONDEV})
+    else
+        OUTPUT=$(aireplay-ng -1 0 -a ${BSSID} -h ${DEVMAC} -T 1 ${MONDEV})
+    fi
+
+    retval=$?
+    if [[ ${retval} -ne 0 ]] ; then
+        :
+    fi
+
+    if [[ ${cnt} -eq 0 ]] ; then
+        printf "\nPress Ctrl+c to exit\n"
+        cnt=1
+        if [[ -n ${CONF_IP} ]] ; then
+            conf_ip ${TUNDEV} && do_ping ${GATEWAY} ${TUNDEV} && do_ping google.com ${TUNDEV} && dl_speed_test ${TUNDEV}
+        else
+            printf "\nYou may want to assign IP manually for the TAP device '${TUNDEV}', e.g:\n"
+            printf "ip address add 192.168.1.13/24 brd + dev ${TUNDEV}\n"
+            printf "ip route add default via 192.168.1.1 dev ${TUNDEV}\n"
+            printf "Or use dhclient3, e.g: dhclient3 at0\n\n"
+        fi
+    fi
+done
