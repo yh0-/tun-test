@@ -10,4 +10,3 @@ REFERENCES:
 NOTES:
 
 - Tested on Debian GNU/Linux Kali Linux 1.0.9 with wireless cards: Realtek RTL8187L (rtl8187), Ralink 2573 USB (rt73usb), Atheros AR9285 (ath9k) and Atheros AR9271 (ath9k_htc).
-
